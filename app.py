@@ -27,11 +27,12 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Model IDs change over time. Override with the GEMINI_MODEL secret/env var or
 # the sidebar field if Google renames or retires this one.
-DEFAULT_MODEL = "gemini-3.6-flash"
-# Used automatically if the chosen model keeps returning server errors (503 etc.).
-FALLBACK_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+# Tried in order if the chosen model is overloaded (5xx) or not found (404).
+FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.1-flash-lite")
 TRANSIENT_CODES = (500, 502, 503, 504)
-RETRY_DELAYS = (2, 5)  # seconds to wait before retry 2 and retry 3
+RETRY_DELAYS = (2, 5)  # extra tries on the chosen model: wait 2s, then 5s
+FALLBACK_RETRY_DELAY = 3  # fallback models get one retry after this many seconds
 
 MAX_FILE_MB = 5
 MAX_PDF_PAGES = 10
@@ -308,27 +309,30 @@ def call_gemini(api_key: str, model: str, prompt: str) -> str:
 
 
 def call_gemini_with_retry(api_key: str, model: str, prompt: str) -> tuple[str, str]:
-    """Call Gemini, retrying server-side errors, then fall back to FALLBACK_MODEL.
+    """Call Gemini, retrying server errors and moving to fallback models if needed.
 
-    Returns (response_text, model_actually_used). Non-transient errors (bad key,
-    unknown model, quota) are raised immediately because retrying cannot fix them.
+    Returns (response_text, model_actually_used). Moves on to the next model when a
+    model is overloaded (5xx) or does not exist (404). Anything else (bad key, quota,
+    invalid request) is raised immediately because another model cannot fix it.
     """
-    models = [model] + ([FALLBACK_MODEL] if model != FALLBACK_MODEL else [])
-    primary_error: Exception | None = None
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    first_error: Exception | None = None
     for index, name in enumerate(models):
-        for delay in (0, *RETRY_DELAYS):
+        delays = (0, *RETRY_DELAYS) if index == 0 else (0, FALLBACK_RETRY_DELAY)
+        for delay in delays:
             if delay:
                 time.sleep(delay)
             try:
                 return call_gemini(api_key, name, prompt), name
             except Exception as exc:
-                if getattr(exc, "code", None) not in TRANSIENT_CODES:
-                    # If only the *fallback* failed oddly, report the original problem.
-                    raise (primary_error if index > 0 and primary_error else exc)
-                if primary_error is None:
-                    primary_error = exc
-                last_error = exc
-    raise primary_error or last_error
+                code = getattr(exc, "code", None)
+                first_error = first_error or exc
+                if code == 404:
+                    break  # this model does not exist; no point retrying it
+                if code not in TRANSIENT_CODES:
+                    raise
+    assert first_error is not None
+    raise first_error
 
 
 def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict[str, Any]:
