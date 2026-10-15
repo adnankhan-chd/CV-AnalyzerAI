@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import Any
 
 import streamlit as st
@@ -27,6 +28,10 @@ from pypdf import PdfReader
 # Model IDs change over time. Override with the GEMINI_MODEL secret/env var or
 # the sidebar field if Google renames or retires this one.
 DEFAULT_MODEL = "gemini-3.6-flash"
+# Used automatically if the chosen model keeps returning server errors (503 etc.).
+FALLBACK_MODEL = "gemini-2.5-flash"
+TRANSIENT_CODES = (500, 502, 503, 504)
+RETRY_DELAYS = (2, 5)  # seconds to wait before retry 2 and retry 3
 
 MAX_FILE_MB = 5
 MAX_PDF_PAGES = 10
@@ -276,8 +281,13 @@ def friendly_api_error(exc: Exception) -> str:
         return "Model not found. Change the model name in the sidebar (see Google's model list)."
     if code == 429 or "quota" in text or "rate" in text:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
-    if code in (500, 502, 503, 504):
-        return "Gemini is temporarily unavailable. Please try again shortly."
+    if code in TRANSIENT_CODES:
+        detail = str(exc).strip().replace("\n", " ")[:200]
+        return (
+            f"Gemini is overloaded or unavailable (HTTP {code}) even after several retries. "
+            "Wait a minute and try again, or pick a different model in the sidebar. "
+            f"Details: {detail}"
+        )
     return f"Gemini request failed: {exc}"
 
 
@@ -297,6 +307,30 @@ def call_gemini(api_key: str, model: str, prompt: str) -> str:
     return response.text or ""
 
 
+def call_gemini_with_retry(api_key: str, model: str, prompt: str) -> tuple[str, str]:
+    """Call Gemini, retrying server-side errors, then fall back to FALLBACK_MODEL.
+
+    Returns (response_text, model_actually_used). Non-transient errors (bad key,
+    unknown model, quota) are raised immediately because retrying cannot fix them.
+    """
+    models = [model] + ([FALLBACK_MODEL] if model != FALLBACK_MODEL else [])
+    primary_error: Exception | None = None
+    for index, name in enumerate(models):
+        for delay in (0, *RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            try:
+                return call_gemini(api_key, name, prompt), name
+            except Exception as exc:
+                if getattr(exc, "code", None) not in TRANSIENT_CODES:
+                    # If only the *fallback* failed oddly, report the original problem.
+                    raise (primary_error if index > 0 and primary_error else exc)
+                if primary_error is None:
+                    primary_error = exc
+                last_error = exc
+    raise primary_error or last_error
+
+
 def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict[str, Any]:
     checks = quick_checks(resume_text)
     prompt = build_prompt(resume_text, job_description, checks)
@@ -304,11 +338,12 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_description: 
     last_error: Exception | None = None
     for _attempt in range(2):  # retry once if the model returns malformed JSON
         try:
-            raw_text = call_gemini(api_key, model, prompt)
-        except Exception as exc:  # network/auth/quota errors: do not retry
+            raw_text, model_used = call_gemini_with_retry(api_key, model, prompt)
+        except Exception as exc:
             raise AppError(friendly_api_error(exc)) from exc
         try:
             result = normalize_analysis(parse_json_response(raw_text))
+            result["model_used"] = model_used
             result["checks"] = checks
             result["used_job_description"] = bool(job_description.strip())
             return result
@@ -380,6 +415,8 @@ def render_results(result: dict[str, Any], filename: str) -> None:
     with right:
         st.subheader("Summary")
         st.write(result["summary"] or "No summary returned.")
+        if result.get("model_used") and result["model_used"] != st.session_state.get("requested_model"):
+            st.caption(f"Note: the selected model was unavailable, so {result['model_used']} was used instead.")
         if not result["used_job_description"]:
             st.caption("No job description supplied, so keywords are judged against the likely target role.")
 
@@ -487,6 +524,7 @@ def main() -> None:
                 result = analyze_resume(api_key.strip(), model.strip(), resume_text, job_description)
             st.session_state["result"] = result
             st.session_state["filename"] = uploaded.name
+            st.session_state["requested_model"] = model.strip()
         except AppError as exc:
             st.session_state.pop("result", None)
             st.error(str(exc))
